@@ -257,18 +257,29 @@ def _probe_video(vpath: str) -> dict:
 
 
 def _probe_creation_time(vpath: str) -> Optional[datetime]:
-    """Best-effort read of a video's embedded creation_time (UTC), or None
-    if absent/unreadable. Used only to detect real inter-segment gaps —
-    never fatal to the sync pipeline if it fails."""
+    """Best-effort read of a video's capture time (UTC), or None if
+    absent/unreadable. Used only to detect real inter-segment gaps —
+    never fatal to the sync pipeline if it fails.
+
+    Tag preference matches session_scanner._ffprobe_creation_time(): the
+    QuickTime capture date wins over `creation_time`, which is rewritten by
+    anything that rewrites the container (exporting from Photos, say). Here
+    that matters as a *difference* between two segments — re-exported clips
+    carry the spacing of the export rather than of the recording, which would
+    be inserted into the timeline as a bogus gap."""
     try:
         result = subprocess.run(
             [_ffprobe(), '-v', 'quiet', '-print_format', 'json',
-             '-show_entries', 'format_tags=creation_time', vpath],
+             '-show_entries',
+             'format_tags=creation_time,com.apple.quicktime.creationdate',
+             vpath],
             capture_output=True, text=True, check=True,
             creationflags=_NO_WINDOW,
         )
         data = json.loads(result.stdout)
-        ct = data.get('format', {}).get('tags', {}).get('creation_time')
+        tags = data.get('format', {}).get('tags', {})
+        ct = (tags.get('com.apple.quicktime.creationdate') or
+              tags.get('creation_time'))
         if not ct:
             return None
         dt = datetime.fromisoformat(ct.replace('Z', '+00:00'))

@@ -4,13 +4,16 @@ Tests for auto_sync.py — video/telemetry sync offset detection.
 All tests use small synthetic numpy signal arrays (no real video files or
 ffmpeg/ffprobe subprocess calls, except where explicitly monkeypatched).
 """
+import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
-from auto_sync import _correlate, _append_gap_frames, _video_gap_seconds, _load_session
+from auto_sync import (_correlate, _append_gap_frames, _video_gap_seconds,
+                       _load_session, _probe_creation_time)
 
 
 # ── _load_session — source dispatch ───────────────────────────────────────────
@@ -231,6 +234,71 @@ def test_video_gap_seconds_missing_creation_time_falls_back_to_zero(monkeypatch)
     monkeypatch.setattr('auto_sync._probe_creation_time', lambda path: None)
     gap = _video_gap_seconds('a.mp4', prev_duration=80.0, cur_path='b.mp4')
     assert gap == 0.0
+
+
+# ── _probe_creation_time ───────────────────────────────────────────────────────
+#
+# A re-exported clip carries two disagreeing timestamps; the gap between
+# segments has to be measured from the capture date, or the spacing of the
+# *export* gets inserted into the timeline as a gap that never happened.
+
+def _fake_ffprobe_returning(monkeypatch, stdout):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(stdout=stdout, stderr='', returncode=0)
+
+    monkeypatch.setattr('auto_sync.subprocess.run', fake_run)
+    monkeypatch.setattr('auto_sync._ffprobe', lambda: 'ffprobe')
+    return calls
+
+
+def test_probe_creation_time_prefers_capture_date(monkeypatch):
+    _fake_ffprobe_returning(monkeypatch, json.dumps({"format": {"tags": {
+        "creation_time": "2026-09-15T01:45:43.000000Z",
+        "com.apple.quicktime.creationdate": "2026-09-11T12:39:29-04:00",
+    }}}))
+    assert _probe_creation_time('/clip.mov') == datetime(
+        2026, 9, 11, 16, 39, 29, tzinfo=timezone.utc)
+
+
+def test_probe_creation_time_asks_for_the_quicktime_tag(monkeypatch):
+    calls = _fake_ffprobe_returning(monkeypatch, json.dumps({"format": {"tags": {}}}))
+    _probe_creation_time('/clip.mov')
+    entries = calls[0][calls[0].index('-show_entries') + 1]
+    assert 'com.apple.quicktime.creationdate' in entries
+    assert 'creation_time' in entries
+
+
+def test_probe_creation_time_falls_back_to_creation_time(monkeypatch):
+    _fake_ffprobe_returning(monkeypatch, json.dumps({"format": {"tags": {
+        "creation_time": "2026-09-12T11:50:54.000000Z"}}}))
+    assert _probe_creation_time('/clip.mp4') == datetime(
+        2026, 9, 12, 11, 50, 54, tzinfo=timezone.utc)
+
+
+def test_export_spacing_does_not_become_a_fake_gap(monkeypatch):
+    """The end-to-end shape of the bug, at the level that matters here.
+
+    Two segments shot back-to-back but exported 5m45s apart: reading the
+    export timestamps would insert a ~265s gap into the correlation timeline.
+    """
+    tags = {
+        'a.mp4': {"creation_time": "2026-09-15T01:45:43.000000Z",
+                  "com.apple.quicktime.creationdate": "2026-09-11T12:39:29-04:00"},
+        'b.mp4': {"creation_time": "2026-09-15T01:51:28.000000Z",
+                  "com.apple.quicktime.creationdate": "2026-09-11T12:44:29-04:00"},
+    }
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(stdout=json.dumps({"format": {"tags": tags[cmd[-1]]}}),
+                               stderr='', returncode=0)
+
+    monkeypatch.setattr('auto_sync.subprocess.run', fake_run)
+    monkeypatch.setattr('auto_sync._ffprobe', lambda: 'ffprobe')
+    # Shot 300s apart, segment A is 300s long -> genuinely back-to-back.
+    assert _video_gap_seconds('a.mp4', prev_duration=300.0, cur_path='b.mp4') == 0.0
 
 
 # ── correlate_channels — secondary telemetry sync ────────────────────────────
