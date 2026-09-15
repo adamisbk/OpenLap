@@ -71,14 +71,29 @@ class VideoFile:
 
 
 def _ffprobe_creation_time(path: str) -> Tuple[Optional[datetime], float]:
-    """Extract (creation_time, duration_seconds) from video metadata via ffprobe."""
+    """Extract (creation_time, duration_seconds) from video metadata via ffprobe.
+
+    QuickTime's `com.apple.quicktime.creationdate` wins over `creation_time`
+    where both are present. They normally agree, but anything that rewrites the
+    container stamps `creation_time` with the time of *that* operation while
+    leaving the capture date alone — exporting from Photos is the common way to
+    meet this, and it can be days after the session. Matching a clip to a
+    session is a question about when it was shot, so the capture date is the
+    one to trust.
+
+    Both tags have to be named in -show_entries: a `format_tags=` list is a
+    filter, so a tag left out of it never reaches us to be preferred.
+    """
     try:
         r = _run([ffprobe_path(), '-v', 'quiet', '-print_format', 'json',
-             '-show_entries', 'format_tags=creation_time:format=duration',
+             '-show_entries',
+             'format_tags=creation_time,com.apple.quicktime.creationdate'
+             ':format=duration',
              path], text=True, timeout=10)
         data = json.loads(r.stdout)
-        ct = (data.get('format', {}).get('tags', {}).get('creation_time') or
-              data.get('format', {}).get('tags', {}).get('com.apple.quicktime.creationdate'))
+        tags = data.get('format', {}).get('tags', {})
+        ct = (tags.get('com.apple.quicktime.creationdate') or
+              tags.get('creation_time'))
         dur = float(data.get('format', {}).get('duration', 0))
         if ct:
             # Normalise timezone

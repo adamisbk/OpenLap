@@ -1,4 +1,6 @@
+import json
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -8,7 +10,7 @@ from session_scanner import (
     group_videos, _make_group,
     _read_csv_start_time, _csv_source, _sniff_candidate,
     match_sessions, MatchedSession,
-    solve_camera_offset,
+    solve_camera_offset, _ffprobe_creation_time,
     MAX_GAP, MATCH_WINDOW,
 )
 
@@ -263,3 +265,86 @@ def test_solve_camera_offset_partial_match_picks_best_alignment():
     offset, count = solve_camera_offset(matching_groups + extra_groups, true_starts)
     assert count == 4
     assert offset == pytest.approx(applied_offset, abs=0.01)
+
+
+# ── _ffprobe_creation_time ─────────────────────────────────────────────────────
+#
+# Tag values below are taken verbatim from two real clips: shot at Blackhawk on
+# 2026-09-11 and 2026-09-12, then exported out of Photos on 2026-09-15. The
+# export is what makes the two tags disagree, by four and three days.
+
+_PHOTOS_EXPORT_JSON = json.dumps({
+    "format": {
+        "duration": "1215.440000",
+        "tags": {
+            "creation_time": "2026-09-15T01:45:43.000000Z",
+            "com.apple.quicktime.creationdate": "2026-09-11T12:39:29-04:00",
+        },
+    }
+})
+
+_CAMERA_ORIGINAL_JSON = json.dumps({
+    "format": {
+        "duration": "740.640000",
+        "tags": {"creation_time": "2026-09-12T11:50:54.000000Z"},
+    }
+})
+
+
+def _probe_returning(stdout: str):
+    """Patch session_scanner._run, capturing the argv it was called with."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(stdout=stdout, stderr='', returncode=0)
+
+    return patch('session_scanner._run', side_effect=fake_run), calls
+
+
+class TestFfprobeCreationTime:
+
+    def test_prefers_capture_date_over_rewritten_creation_time(self):
+        """A Photos export stamps creation_time with the export, days later."""
+        patcher, _ = _probe_returning(_PHOTOS_EXPORT_JSON)
+        with patcher:
+            dt, dur = _ffprobe_creation_time('/clip.mov')
+        # 12:39:29-04:00 is 16:39:29Z — the session, not the 09-15 export.
+        assert dt == datetime(2026, 9, 11, 16, 39, 29, tzinfo=timezone.utc)
+        assert dur == pytest.approx(1215.44)
+
+    def test_asks_ffprobe_for_the_quicktime_tag(self):
+        """The regression guard that a response-only mock cannot provide.
+
+        -show_entries format_tags=<list> is a filter: the original code asked
+        only for creation_time, so its fallback to the QuickTime tag could
+        never fire no matter what the file contained.
+        """
+        patcher, calls = _probe_returning(_PHOTOS_EXPORT_JSON)
+        with patcher:
+            _ffprobe_creation_time('/clip.mov')
+        argv = calls[0]
+        entries = argv[argv.index('-show_entries') + 1]
+        assert 'com.apple.quicktime.creationdate' in entries
+        assert 'creation_time' in entries
+        assert 'format=duration' in entries
+
+    def test_falls_back_to_creation_time_when_no_capture_date(self):
+        """Straight off the camera there is only the one tag."""
+        patcher, _ = _probe_returning(_CAMERA_ORIGINAL_JSON)
+        with patcher:
+            dt, dur = _ffprobe_creation_time('/clip.mp4')
+        assert dt == datetime(2026, 9, 12, 11, 50, 54, tzinfo=timezone.utc)
+        assert dur == pytest.approx(740.64)
+
+    def test_no_tags_still_returns_duration(self):
+        patcher, _ = _probe_returning(json.dumps({"format": {"duration": "12.5"}}))
+        with patcher:
+            dt, dur = _ffprobe_creation_time('/clip.mp4')
+        assert dt is None
+        assert dur == pytest.approx(12.5)
+
+    def test_ffprobe_failure_is_not_fatal(self):
+        with patch('session_scanner._run', side_effect=OSError('no ffprobe')):
+            dt, dur = _ffprobe_creation_time('/clip.mp4')
+        assert (dt, dur) == (None, 0.0)
